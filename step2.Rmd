@@ -1,0 +1,565 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+---
+# Homework 2: Feature Engineering with Clinical Data [80 points]
+
+### HIDS 501, Fall 2019 
+### Due: Friday, November 15, 2019
+### Linyu Li
+
+
+In this assignment you will gain experience transforming clinical data into sets of features for downstream statistical analysis. You will practice using common time-saving tools in the R programming language that are ideally suited to these tasks.
+
+You will primarily be building off of the cohort that you developed in the Cohort Building homework. In particular, you will extract features from vitals, diagnosis codes, and more that can be used to predict the future development of septic shock. 
+
+You will not be replicating the models presented in ["A targeted real-time early warning score (TREWScore) for septic shock" by Henry et al.](http://stm.sciencemag.org/content/7/299/299ra122.full) directly, but we include a link to the paper for your reference.
+
+All of the data you need for this assignment is available on Box. Please download the data and markdown (containing the assignment questions) from Box under the shared folder  "homework2"
+
+Please edit this document directly using either Jupyter or R markdown in RStudio and answer each of the questions in-line. Turn in a single .pdf document showing all of your code and output for the entire assignment, with each question clearly demarcated. Submit your completed assignment through Canvas.
+
+## 0. Getting Ready
+
+The first thing we need to do is load all of the packages we will use for this assignment. Please load the packages `tidyverse`, `lubridate`, `data.table`, `Matrix`, and `glmnet`. Also, please run the command `Sys.setenv(TZ='UTC')`.
+```{r}
+setwd("D:\\501hw2")
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(data.table)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(glmnet)
+Sys.setenv(TZ='UTC')
+```
+## 1. Defining labels for prediction
+
+
+##### 1.1 (10 pts)
+We are going to take the cohort you worked with on the previous assignment and explore some methods of feature engineering for the task of predicting whether a patient will go on to develop septic shock. You will start with a dataset similar to what you might have generated at the end of the prior assignment. This dataset is available in the file `cohort_labels.csv`.
+
+The prediction problem motivating this assignment is to predict, at 12 hours into an admission, whether septic shock will occur during the remainder of the admission, with at least 3 hours of lead time. Your task is to engineer a set of features that may used as the inputs to a model that makes this prediction.
+
+To that end, you first need to engineer some labels from the data and define an **index time** for each admission. For each patient, you will only consider the **index time** corresponding to the latest valid **label** so that we make only one prediction per patient. You will then engineer some features using the data available for the patient prior to the **index time**. 
+
+We will derive the **labels** and **index times** in a way that aligns with the task description above. Not that this is not the same procedure as in the TREWscore paper.
+
+
+We will use the following definitions:
+
+
+* We will only assign labels to admissions of at least twelve hours in duration.
+* An admission is assigned a negative label if septic shock does not occur at any time during the admission.
+* An admission is assigned a positive label if septic shock occurs fifteen hours after admission or later.
+* Admissions where the earliest time of septic shock occurs prior to fifteen hours after admission are removed from the study.
+* For admissions that have valid labels, we assign an index time at twelve hours into the admission. For prediction, we only use information that occurs before the index time.
+* In the case that a patient has multiple admissions for which a valid index time and label may be assigned, we only use the latest one.
+
+To begin, given the above definitions, load `cohort_labels.csv` and `ADMISSIONS.csv` derive the binary classification labels for septic shock and the corresponding index times for each patient in the dataframe. The result should be a dataframe with one row per patient and additional columns for `index_time` and `label`.
+
+How many patients receive a positive or negative label?
+
+
+```{r}
+"./data/cohort_labels.csv" %>%
+  read_csv(n_max = 10000)-> cohort_labels
+
+"./data/ADMISSIONS.csv" %>%
+  read_csv(n_max = 10000)-> admissions
+
+adm_labels<-admissions %>%
+  filter(difftime(DISCHTIME,ADMITTIME,units='hour')>=12) 
+
+cohort_adm_labels = left_join(adm_labels,cohort_labels,by=c('SUBJECT_ID'='subject_id','HADM_ID'='hadm_id'))
+
+labels_removed<-cohort_adm_labels %>%
+  filter(difftime(charttime,ADMITTIME,units='hour')>=15)
+
+cohort_adm_labels1<-labels_removed %>%
+  group_by(SUBJECT_ID,HADM_ID)%>%
+  mutate(label = ifelse(sum(septic_shock)!=0,"positive","negative"))%>%
+  ungroup()
+
+cohort_adm_labels2<-cohort_adm_labels1 %>%
+  group_by(SUBJECT_ID,HADM_ID)%>%
+  mutate(index_time=max(ADMITTIME)+hours(12))%>%
+  ungroup()
+
+cohort_adm_labels3<-cohort_adm_labels2%>%
+  group_by(SUBJECT_ID)%>%
+  filter(index_time==max(index_time))%>%
+  ungroup()
+
+cohort_adm_labels4<-cohort_adm_labels3%>%
+  group_by(SUBJECT_ID,HADM_ID,label)%>%
+  summarise(index_time=max(index_time)) %>%
+  ungroup()
+
+  colnames(cohort_adm_labels4)[c(1)] <- ("subject_id")
+  colnames(cohort_adm_labels4)[c(2)] <- ("hadm_id")
+  
+head(cohort_adm_labels4)
+table(cohort_adm_labels4$label)
+
+```
+
+
+
+
+----
+
+
+## 2. Building a Patient-Feature Matrix for the Septic Shock Cohort
+
+Now that we know have derived labels and index times for each patient in our cohort, we can start to engineer some features from the data that occur prior to the index times and will be useful for predicting onset of septic shock.
+
+### Diagnoses
+
+##### 2.1 (2 pts)
+
+Let's first deal with diagnoses. Load `diagnoses_icd.csv`. We would like to find the diagnoses that occurred before the index time for each patient, but it looks like there is no time recorded in the diagnosis table.
+Which table and columns in MIMIC would you use to find the times of each diagnoses? Justify your response.
+Use the online documentation to find out.
+
+
+```{r}
+"./data/DIAGNOSES_ICD.csv" %>%
+read_csv(n_max = 10000)-> diag_icd
+```
+*table:ADMISSIONS.csv*
+*column:DISCHTIME*
+
+
+----
+
+
+##### 2.2 (2 pts)
+
+Use the table you have selected in conjunction with the diagnoses and your cohort table to filter the diagnoses for each patient that were recorded before the index time. The final result should have the columns `subject_id`, `hadm_id`, `diagnosis_time`, `icd9_code`, and `index_time`.
+How many subjects have diagnoses recorded prior to the index_time? Does the resulting number make sense?
+
+
+```{r}
+admissions<-admissions%>%
+  select(SUBJECT_ID,HADM_ID,DISCHTIME)
+
+diag_adm=merge(diag_icd,admissions)
+
+cohort_diag_adm=merge(cohort_adm_labels4,diag_adm,by.x=c('subject_id'),by.y=c('SUBJECT_ID'))
+
+colnames(cohort_diag_adm)[c(8)] <- ("icd9_code")
+colnames(cohort_diag_adm)[c(9)] <- ("diagnosis_time")
+
+cohort_diag_adm <- cohort_diag_adm %>%
+  select(c(subject_id,hadm_id,diagnosis_time,icd9_code,index_time)) %>%
+  filter(diagnosis_time<index_time)
+
+n1 <- cohort_diag_adm%>%
+  pull(subject_id)%>%
+  unique()
+
+length(n1)
+```
+*There are 6892 subjects*
+*This resulting number make sense.*
+
+----
+
+
+##### 2.3 (3 pts)
+What are the top 10 most common diagnosis codes (by number of unique patients who had the code in their history) in the data frame resulting from question 2.2? Look up the top 3 codes online and report what they refer to.
+
+```{r}
+diag_common<-cohort_diag_adm %>%
+  group_by(icd9_code)%>%
+  summarise(n2=n_distinct(subject_id))%>%
+  arrange(desc(n2))
+
+head(diag_common,10)
+```
+*top 3 codes are '4019', '4280' and '42731'. *
+
+*'4019': Unspecified essential hypertension*
+*'4280': Congestive heart failure, unspecified*
+*'42731': Atrial fibrillation.*
+
+----
+
+
+##### 2.4 (3 pts)
+
+For the set of codes and patients that remain after the index time filtering step, make a histogram demonstrating the distribution of the number of unique diagnostic histories that the codes belong to. In other words, generate a histogram of the count data you generated in 2.3. 
+The x-axis should represent the number of admissions that a code belongs to the history of and the y axis should represent the number of codes that were observed in the same number of admissions.
+In 1-2 sentences, interpret the results
+
+```{r}
+hist1 <- diag_common %>%
+  ggplot(aes(x=n2))+
+  geom_histogram()+
+  xlab("the number of unique diagnostic histories")+
+  ylab("the number of codes")
+print(hist1)
+
+```
+*Most of the number of unique diagnostic histories is below 500. When  the number of unique diagnosis histories increase, the number of codes that were observed in the same number of admissions decrease sharply.*
+----
+
+
+##### 2.5 (5 pts)
+As you observed from the plot you created above, there are many rare diagnoses, resulting in a sparse feature space. One way to manage this is to identify rare (and similarly, very common) features using *Information content (IC)*. IC is a measure of specificity based on the frequency of occurrence of features.
+
+The IC of a feature that occurs in a set of records is calculated as 
+
+$-log_2 \left( \frac{count(\text{feature})}{count(\text{record})} \right)$
+
+Use this equation to calculate the IC of ICD9 codes based on their occurrence in the diagnosis records for the sepsis cohort.
+
+
+```{r}
+
+dx_ICD9 <- diag_common %>% 
+  group_by(icd9_code) %>% 
+  summarise(count = n2) %>% 
+  mutate(IC = -log2(count/nrow(diag_common))) 
+head(dx_ICD9)  
+
+```
+
+----
+
+##### 2.6 (3 pts)
+
+What is the range (min and max) of ICs observed in your data? What are the 10 most specific ICD9 codes?
+
+```{r}
+range(dx_ICD9$IC)
+max(dx_ICD9$IC)
+min(dx_ICD9$IC)
+
+dx_ICD9<-dx_ICD9%>%
+arrange(IC)
+
+head(dx_ICD9,10)
+```
+
+---
+
+
+##### 2.7 (2 pts)
+Filter the set of ICD9 codes for the diagnoses associated with the set of admissions to those with an IC between 6 and 10.
+
+```{r}
+
+dx_ICD9%>%
+  filter(between(IC,6,10))%>%
+  pull(icd9_code)
+
+head(dx_ICD9)
+
+```
+
+
+---
+
+
+##### 2.8 (12 pts)
+Now we have our diagnoses features and the times they occured for each patient. 
+All that is left to do is to create a patient-feature matrix that summarizes and organizes the diagnoses features. 
+In this matrix, each row is an patient and each column in a diagnosis code, time binned by whether or not it occured in the preceeding 6 months prior to the index time. In other words, we are going to generate two features for each diagnosis code where one feature represents the count of the number of times the code was observed in the six months prior to the index time and the other features represents the number of times that code was observed in the medical history older than six months.
+
+Given the sparsity of the feature space, we are not going to directly instantiate the resulting wide feature matrix since it is inefficient to do. Instead, we aim to generate a long three column matrix with the columns `subject_id`, `feature_name`, and `feature_value`.
+
+What are the dimensions of your resultant dataframe?
+
+```{r}
+
+feature_matrix_after <- cohort_diag_adm %>%
+  filter(diagnosis_time+days(180)<index_time) %>%
+  mutate(feature_name = paste(icd9_code, "after")) %>%
+  group_by(subject_id) %>%
+  summarise(feature_value = n()) %>%
+  ungroup()
+
+feature_matrix_before <- cohort_diag_adm %>%
+  filter(diagnosis_time+days(180)>index_time) %>%
+  mutate(feature_name = paste(icd9_code, "before")) %>%
+  group_by(subject_id,feature_name) %>%
+  summarise(feature_value = n()) %>%
+  ungroup()
+
+feature_union1 <-feature_matrix_before %>%
+  union_all(feature_matrix_after)
+
+dim(feature_union1)
+```
+
+----
+
+### Vitals
+
+
+##### 2.9 (3 pts)
+
+Now let's engineer some features from vital sign measurements that may also relevant to predicting septic shock.
+
+Here we will work with the patient's heart rates. Load the file `vitals_cohort_sirs.csv` (this file will be familiar to you at this point). Once you have done so, filter measurements so that you are only looking at Heart Rate  measurements that occured prior to the index time for the set of patients in our cohort.
+
+How many admissions are left in the dataframe after performing this filtering step?
+
+
+```{r}
+"./data/vitals_cohort_sirs.csv" %>%
+read_csv(n_max = 10000)-> vitals_cohort_sirs
+
+vitals_cohort_sirs<-vitals_cohort_sirs%>%
+  select(subject_id,hadm_id,charttime,valuenum,vital_id)%>%
+  filter(vital_id=="HeartRate")
+
+cohort_vitals <- left_join(vitals_cohort_sirs,select(cohort_diag_adm,c(1,5)))%>%
+  filter(charttime<index_time)
+head(cohort_vitals)
+
+n3 <- cohort_vitals %>%
+  pull(hadm_id)%>%
+  unique()
+
+length(n3)
+
+
+```
+*15437 admissions are left in the dataframe*
+----
+
+
+##### 2.10 (5 pts)
+
+One feature of interest might be the latest value of the heart rate before the cutoff time. Make a dataframe with four columns: `subject_id`, `hadm_id`, `latest_heart_rate`, and `charttime`. 
+
+What is the average value of the latest recorded heart rate in this cohort? Additionally, make a histogram or density plot of the latest heart rate colored by whether a patient develops septic shock during the admission.
+
+```{r}
+
+
+latest_vitals0 <- cohort_vitals%>%
+  group_by(subject_id)
+
+latest_vitals1 <- latest_vitals0%>%
+  arrange(desc(charttime))
+
+latest_vitals2 <- latest_vitals1%>%
+  filter(row_number()==1)
+
+latest_vitals <- latest_vitals2%>%
+  select(c(subject_id,hadm_id,valuenum,charttime))
+
+colnames(latest_vitals)[3]="latest_heart_rate"
+
+avg <- mean(latest_vitals$latest_heart_rate)
+print(avg)
+
+cohort_adm_labels5 <-cohort_adm_labels4%>%
+  select(hadm_id,label)
+head(latest_vitals)
+merge_latest_cohort <-merge(latest_vitals,cohort_adm_labels5) 
+
+
+hist2 <- merge_latest_cohort %>%
+  ggplot(aes(x=latest_heart_rate,color=label))+
+  xlab("latest heart rate")+
+  ylab("count")+
+  geom_histogram(binwidth = 0.5)
+
+print(hist2)
+
+```
+*Average value is 83.87241*
+----
+
+
+##### 2.11 (5 pts)
+
+The latest recorded heart rate might not be a useful feature to use if the latest recording is not near the index time. Make a density plot of the time difference between the latest heart rate recording and the cutoff time colored by whether a patient develops septic shock during the admission. Feel free to modify the axes limits if that helps you interpret the plot.
+
+```{r}
+indextime<-cohort_adm_labels4%>%
+  select('subject_id','index_time','label')
+
+chart_time<-merge_latest_cohort%>%
+  select('subject_id','charttime')
+
+index_chart<-left_join(chart_time,indextime)
+
+densityplot <- index_chart%>%
+  ggplot(aes(x=difftime(index_time,charttime,units='hours'),color=label))+
+  geom_density()+
+  xlim(0,3)
+
+print(densityplot)
+```
+
+----
+
+
+##### 2.12 (5 pts)
+Some patients might have many heart rate recordings, and only using the last one might not be the best idea- it's possible the latest measurement is an outlier. Let's try to leverage all the heart rate measurements we have by creating a time-weighted average heart rate. Use the formula $w = e^{(-|\Delta t| - 1)}$ to calculate the weights of each measurement, where $\Delta t$ is the time difference between the measurement time and the cutoff time in hours. Calculate the weighted average with the formula $\bar{x}_w = \sum(x_i w_i)/\sum(w_i)$. The result should be a dataframe with two columns: `subject_id` and `time_wt_avg`.
+
+What is the average time-weighted average heart rate across all patients? 
+
+```{r}
+weight_cohort_vitals0 <- cohort_vitals %>%
+  mutate(abs_t=abs(difftime(index_time,charttime,units='hours')))
+
+weight_cohort_vitals1 <- weight_cohort_vitals0 %>%
+  mutate(w = exp(as.double(-(abs_t)-1)))
+
+weight_cohort_vitals<-weight_cohort_vitals1%>%
+  group_by(subject_id)%>%
+  summarise(time_wt_avg=sum(valuenum*w)/sum(w))
+head(weight_cohort_vitals)
+
+
+avg_time_wt_avg <- mean(weight_cohort_vitals$time_wt_avg,na.rm=1) 
+print(avg_time_wt_avg)
+
+```
+*The average time-weighted average heart rate is 84.4797*
+----
+
+
+##### 2.13 (2 pts)
+Let's do a sanity check to see if what we've done makes sense. We expect that the time-weighted average heart rate and the latest recorded heart rate should be similar.
+
+Make a scatterplot of the latest recorded heart rate (x-axis) and the time-weighted average heart rate (y-axis) of each patient.
+
+```{r}
+
+latest_vitals %>% 
+  left_join(weight_cohort_vitals) %>% 
+  ggplot(aes(x = latest_heart_rate,
+             y = time_wt_avg)) + 
+  geom_point()
+
+```
+
+----
+
+
+##### 2.14 (3 pts)
+
+Now we would like to condense our vital information into a three column dataframe with columns `subject_id`, `feature_name`, `feature_value`. Combine the latest heart rate and the time weighted heart rate dataframes to produce a dataframe that conforms to the specified format.
+
+```{r}
+feature_latest <- latest_vitals%>%
+  mutate(feature_name="latest_heart_rate",feature_value=latest_heart_rate)%>%
+  filter(is.na(feature_value)==FALSE)
+feature_weight <- weight_cohort_vitals%>%
+  mutate(feature_name="time_wt_avg",feature_value=time_wt_avg)%>%
+  filter(is.na(feature_value)==FALSE)
+  
+feature_latest <- feature_latest%>%
+  select(subject_id,feature_name,feature_value)
+feature_weight <-feature_weight%>%
+  select(subject_id,feature_name,feature_value)
+
+feature_union2 <- feature_weight %>%
+  left_join(feature_latest)%>%
+  arrange(subject_id)
+
+head(feature_union2)
+```
+
+
+----
+
+### Stitching together Disease and Vitals Features
+
+
+##### 2.15 (5 pts)
+Our patient-feature matrix will simply be the amalgamation of the different feature matrices we've created. Use a full join to combine the feature matrices you derived from the diagnoses and heart rates measurements.
+How many total features are there?
+
+
+```{r}
+features <- feature_union1 %>%
+  full_join(feature_union2)
+
+n4=features %>%
+  pull(feature_name)%>%
+  unique()
+
+length(n4)
+
+```
+*There are 3279 features in total.*
+
+
+
+
+
+## 3. Classification
+
+##### 3.1 Open-ended feature engineering (5 points)
+
+Outside of the features we engineered previously in the assignment, what additional features can be used for septic shock prediction?
+
+Go through the MIMIC tables (https://mimic.physionet.org/mimictables/) and identify five new MIMIC tables, which can be used to extract additional features. In addition to tables, also identify the columns you would use to develop new features. Definition tables (e.g. d_items, d_CPT, etc), the admissions table, and the patients table do not count towards the five.
+
+*We can use GCS, BUN, hematocrit, and heart rate recorded in the EHR to predict septic shock.*
+
+*The cptevents table: CPT_CD, CPT_SUFFIX*
+*The drgcodes table: DRG_CODE, DESCRIPTION, DRG_SEVERITY, DRG_MORTALITY*
+*The inputevents_cv table: ITEMID, RATE, RATEUOM*
+*The datetimeevents table: RESULTSTATUS, WARNING, ERROR, STORETIME*
+*The labevents table: ITEMID, VALUE, VALUENUM, VALUEUOM, FLAG*
+
+
+
+
+----
+
+
+##### 3.2 Logistic regression classifier (5 points)
+
+Having made it this far, you have picked up a few generalizable techniques that can now be used to extract features from various modalities of clinical data. To test the skills you've learned thus far, use the extracted features (the disease and vitals features) as input to a simple classifier. 
+
+
+To start, we provide you with some baseline code below that runs a logistic regression classifier with a Lasso L1 penalty and plots the cross-validation AUC-ROC over a range of regularization penalties.
+
+* Adapt the model-fitting code provided below to your new dataset to perform 10-fold cross validation to fit a regularized logistic regression with glmnet and plot the AUC-ROC over the range of `lambda` values.
+
+
+Feel free to modify anything you would like in the code below to fufill your purposes. That said, you are not being evaluated on the performance of your classifier and are instead being evaluated on your feature engineering procedure and discussion, so do not expend too much effort in getting a good AUC-ROC.
+
+```{r warning = FALSE}
+# Baseline implementation - provided
+
+## Example of how to create sparse matrix
+subject_map <- features %>% select(subject_id) %>% distinct() %>% mutate(subject_idx = 1:n())
+feature_map <- features %>% select(feature_name) %>% distinct() %>% mutate(feature_idx = 1:n())
+features <- features %>% left_join(subject_map) %>% left_join(feature_map)
+subject_map <- subject_map %>% left_join(cohort_adm_labels4[, c('subject_id', 'label')]) %>% mutate(label = as.factor(label))
+
+## Create the sparse matrix
+sparse_features <- sparseMatrix(i = features$subject_idx, j = features$feature_idx, x = features$feature_value)
+label_vector <- subject_map$label
+
+## Fit the model with cross validation
+model_cv <- cv.glmnet(sparse_features, label_vector, nfolds = 10, family = "binomial", type.measure = "auc")
+
+## Plot the result
+plot(model_cv)
+
+```
+
+
+
+
+
+----
+
+### Done!
+
+That's it! You've gone through the major steps of transforming different kinds of data stored in a longitudinal database into a patient-feature matrix that we can use for association tests and prediction tasks. Along the way we hope you have gained practice in how to effectively use the `dplyr` and `tidyr` packages to manipulate data and the `ggplot2` package to make visual diagnostics. You are well on your way to being able to perform a clinical informatics study.

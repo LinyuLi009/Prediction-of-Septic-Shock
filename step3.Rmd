@@ -1,0 +1,499 @@
+
+# Homework 3: Statistical Analyses of Clinical Datasets
+
+### HIDS 501, Fall 2019
+
+### Due: Friday, December 13, 2019
+
+In this assignment you will gain experience analyzing preprocessed clinical datasets. You will practice using common time-saving tools in the `R` programming language that are ideally suited to these tasks. 
+You will work with a dataset that we have prepared for you using a process similar to what you did in HW 1,2. The dataset describes patients from the [MIMIC III database](https://mimic.physionet.org/mimictables/patients/) who were put on mechanical ventilation and were stable for 12 hours. Some of these patients then experienced a sudden and sustained drop in oxygenation, while others did not. 
+We have recorded a variety of features about each patient before the 12-hour mark (the index time), including counts of all prior diagnoses (aggregated with IC), all respiratory-related concepts in their notes, and indicators of events recorded in the patient charts. Indicator features are the number of times each event was recorded in the patient record, regardless of what the measured value was. For those chart events which have numeric values associated wtih them (e.g. lab tests) we found those in which a value was recorded for over 85% of the cohort and included the latest recorded value of those features. In addition, we have included demographic features (age and sex). For the small number of patients who did not have one or more of those features recorded, we used column-mean imputation to impute them. We also recorded whether or not each patient went on to experience a sudden and sustained drop in their oxygenation (the exposure). Finally, we recorded whether or not each patient eventually died during their hospitalization (the outcome). All of that data is contained in `patient_feature_matrix.csv`. Its companion file `feature_descriptions.csv` has descriptions of each of the features and their provenance. The final dataset you have access to is called `cohort.csv`, which contains the index time, exposure time (if any), in-hospital time of death (if any), and the time of censoring (when the patient was released from the hospital).
+Please edit this document directly using either Jupyter Notebook or R markdown in R Studio and answer each of the questions below in-line. Jupyter and R markdown are useful tools for reproducible research that you will use over and over again in your later work. They are worth taking the short amount of time necessary to learn them. Turn in a single `.pdf` document showing all of your code and output for the entire assignment, with each question clearly demarcated. Submit your completed assignment through Canvas.
+
+**Grading**: All answers will be graded on the correctness and quality of your code and analyses. Partial credit will be given based on a demonstration of conceptual understanding and how close you can come to solving the problem. At various points we will ask you to produce particular values: the correctness of these numbers will not be used for your grade - they are tools for us to get an idea about what your code is doing.
+
+
+## 0. (2 pts) Getting Ready
+
+The first thing we need to do is load all of the important packages we will use for this assignment. Please load the packages  `caret`,  `ggplot2`, and `dplyr`. There are several other packages you will need or may want to use during the course of the assignment but if you need a package other than one of these three for a particular problem it will be noted in the problem statement.
+
+Next, load the CSV files `patient_feature_matrix.csv`, `cohort.csv` and `feature_descriptions.csv` as data frames.
+
+```{r}
+setwd("D:\\501hw3")
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(data.table)
+library(Matrix)
+library(dplyr)
+library(caret)
+library(tidyr)
+library(glmnet)
+library(FSA)
+Sys.setenv(TZ='UTC')
+
+
+"./data/cohort.csv" %>%
+  read_csv()-> cohort
+
+"./data/feature_descriptions.csv" %>%
+  read_csv()-> feature_descriptions
+
+"./data/patient_feature_matrix.csv" %>%
+  read_csv()-> patient_feature_matrix
+
+```
+
+
+
+
+
+
+## 1. (8 pts) Preprocessing
+
+### 1.1 (3 pts) Creating Feature Matrix and Outcome Vector
+
+Split the patient matrix up into a numerical matrix of features and a character vector of the outcome (died or survived). For the feature matrix, exclude the subject ID and the outcome variable and use `data.matrix()`. 
+
+```{r}
+features <- patient_feature_matrix %>%
+  select(-c("subject_id", "death_in_stay"))%>%
+  mutate(gender = ifelse(gender=="M", 1, 0))%>%
+  mutate(oxy_drop = ifelse(oxy_drop =="stable", 0, 1))%>%
+  data.matrix()
+
+
+outcome <- patient_feature_matrix %>%
+  select(c('subject_id', 'death_in_stay'))%>%
+  mutate(death_in_stay = ifelse(death_in_stay =="died", 1, 0))%>%
+  data.matrix()
+
+```
+
+### 1.2 (5 pts) Removing Uninformative Features
+
+Before we do any modeling, let's cut down on our feature space by removing low-variance features that probably aren't useful enough to measure association with or use in a predictive model. `caret` has a function to do that, so let's use it instead of reinventing the wheel. 
+
+Find the relevant function in the `caret` documentation and use it to create a new patient-feature matrix with only the useful features. From now on we will use the result of this step instead of the full feature matrix. Report how many of each different kind of feature are left after filtering out the near-zero variance features. As a sanity check, look at the kinds of features that are over-represented or under-represented in this set relative to the full set of features. Explain in a sentence if and why the result makes sense to you.
+
+```{r}
+features_caret <- features %>%
+  nearZeroVar(saveMetrics = TRUE, names = FALSE) %>% 
+  mutate(name=row.names(.))
+
+features_caret_nzv <- features_caret %>%
+  filter(nzv == "FALSE")%>%
+  pull(name)
+
+features_caret <- features %>%
+  data.frame() %>% 
+  select(features_caret_nzv)
+
+
+features_caret1<-features_caret%>%
+  mutate(name=row.names(.))
+
+features_caret2<-feature_descriptions%>%
+  filter(feature %in% name)
+  
+features_caret3<-features_caret2%>%
+  group_by(feature_type)%>%
+  summarise(count = n())
+
+features_caret4<-features_caret3%>%
+  mutate(frequency=count/sum(count))
+  
+view(features_caret4)
+
+#	chartindicator is over-represented, and engineered is under-represented.
+
+```
+
+## 2. (70 pts) Associative Analyses
+
+In this part of the assignment, you will use statistical tests to evaluate hypotheses about the relationship between  patient features and the binary outcome of whether a patient died during their ICU stay. You will also do a survival analysis using Kaplan-Meier curves and Cox regression to assess whether survival is significantly different between those who experienced a sudden and sustained drop in oxygenation, and those who did not.
+
+### 2.1 (19 pts) Hypothesis testing
+
+#### 2.1.1 (12 pts) Statistical Tests of Differences Between Two Groups
+
+For the features `alarms` (chart indicator), `activity` (chart indicator), `respiratory rate` (chart value), `arterial PaCO2` (chart value), `oxy_drop` (engineered feature) and `snomed ct concept` (note CUI), use a t-test, rank-sum test, Fisher exact test, or a $\chi^2$ (chi squared) test (wichever is most appropriate) to determine if each of these features is associated with mortality. Write your reasoning for determining which kind of test to use. If multiple tests are applicable to a comparison, use all of the applicable tests and compare the results. 
+
+```{r}
+feature_descriptions <- feature_descriptions %>%
+  data.frame()
+ 
+feature_ttest <-feature_descriptions
+
+feature_ttest <-feature_ttest%>%
+  filter(description %in% c('Alarms','Activity','Respiratory Rate', 'Arterial PaCO2','snomed ct concept'))%>%
+  pull(feature)
+
+feature_ttest <-feature_ttest%>%
+  as.list()
+feature_ttest1 <- c(feature_ttest,'oxy_drop','C2720507') %>%
+  as.character()
+
+feature_ttest_matrix <-patient_feature_matrix %>%
+  select(feature_ttest1,'C2720507') %>%
+  mutate(oxy_drop = ifelse(oxy_drop =="stable", 0, 1)) %>%
+  as.data.frame()
+
+feature_ttest1<-feature_ttest1%>%
+  data.frame()
+feature_ttest1$pvalue<-c(NA) 
+
+colnames(feature_ttest1)=c("feature_name","pvalue")
+
+outcome1<-outcome%>%
+  data.frame()
+
+for(i in 1:7){
+  t.test(feature_ttest_matrix[, i] ~ outcome1$death_in_stay)-> a
+if(a$p.value < 1){ 
+  feature_ttest1$pvalue[[i]] <- a$p.value
+}
+}
+nrow(feature_ttest1)
+
+b<- 0
+for(i in 1:7){
+  t.test(feature_ttest_matrix[, i] ~ outcome1$death_in_stay)-> a
+if(a$p.value<0.05){ 
+  b+1 -> b
+print(colnames(feature_ttest_matrix[b]))
+}
+}
+
+feature_ttest_matrix1 <- feature_ttest_matrix%>%
+  data.frame()
+
+  as.factor(feature_ttest_matrix1$oxy_drop)
+  as.factor(feature_ttest_matrix1$C2720507)
+
+chisq.test(table(feature_ttest_matrix1$oxy_drop,outcome1$death_in_stay),correct=FALSE)
+chisq.test(table(feature_ttest_matrix1$C2720507,outcome1$death_in_stay),correct=FALSE)
+
+
+#For the features `alarms` (chart indicator), `activity` (chart indicator), `respiratory rate` (chart value), `arterial PaCO2` (chart value), I chose T-test, because these four features are continuous.
+#For `oxy_drop` (engineered feature) and `snomed ct concept` (note CUI),I can't use Ttest because they are logical factors, not the continuous number, that's why both fisher and chi square can use. However fisher test more useful to the sample that have the small amount of data, chi square is more useful for the large data sample, so I chose chi squared test.
+
+```
+#### 2.1.2 (7 pts) Hypothesis testing with Bonferroni correction
+(a) Perform statistical tests (t-test) to evaluate association of all chart value features with death during ICU stay as an outcome.  How many chart value features are significantly associated with death (according to a t-test) at the standard cutoff of 0.05?
+
+```{R}
+features_caret <- features_caret %>%
+   data.table()
+
+feature_chartvalue <-feature_descriptions%>%
+  filter(feature %in% names(features_caret))%>%
+  filter(feature_type == "chartvalue")%>%
+  pull(feature)
+
+features_nzv_chartvalue <- features_caret %>%
+   select(feature_chartvalue)
+
+features_nzv_chartvalue <-features_nzv_chartvalue%>%
+  as.data.frame()
+
+outcome<-outcome%>%
+  as.data.frame()
+
+
+feature_chartvalue <- feature_chartvalue%>% 
+as.data.frame()
+
+
+feature_chartvalue$pvalue<-c(NA) 
+
+for(i in 1:48){
+  t.test(features_nzv_chartvalue[, i] ~ outcome$death_in_stay)-> a
+  feature_chartvalue$pvalue[[i]] <- a$p.value
+if(a$p.value < 1){ 
+  feature_chartvalue$pvalue[[i]] <- a$p.value
+}
+}
+nrow(feature_chartvalue)
+
+b<- 0
+for(i in 1:48){
+  t.test(features_nzv_chartvalue[, i] ~ outcome$death_in_stay)-> a
+if(a$p.value<0.05){ 
+  b+1 -> b
+
+}
+}
+ print(b)
+ 
+#There are 30 chart value features are significantly associated with death.
+
+```
+
+
+(b) When you perform a large number of statistical tests, some will have P values less than 0.05 purely by chance, even if all your null hypotheses are really true. The Bonferroni correction is one simple way to take this into account. Read more about Bonferroni correction here: http://www.biostathandbook.com/multiplecomparisons.html
+Use Bonferroni correction to determine the p-value cutoff if you were to evaluate association of all chart value features with death during ICU stay as an outcome. How many chart value features are significantly associated with death at this cutoff? 
+
+
+```{R}
+
+feature_chartvalue = feature_chartvalue[order(feature_chartvalue$pvalue),]
+
+headtail(feature_chartvalue)
+
+feature_chartvalue$Bonferroni =
+      p.adjust(feature_chartvalue$pvalue,
+               method = "bonferroni")
+
+
+colnames(feature_chartvalue)=c("feature_name","pvalue","bonferroni")
+
+
+feature_bonferroni<-feature_chartvalue%>%
+  filter(feature_chartvalue$bonferroni<0.05)%>%
+  select(feature_name,bonferroni)
+nrow(feature_bonferroni)
+
+#There are 26 chart value features are significantly associated with death.
+
+```
+
+### 2.2 (26 pts) Adjusted Analyses
+
+In this part of the assignment you will build and compare several  regression models for the binary outcome of death during hospitalization. 
+Some resources for regression models you might find useful:
+
+(1) https://stats.idre.ucla.edu/r/dae/logit-regression/
+
+(2) https://data.princeton.edu/R/GLMs
+
+
+#### 2.2.1 (9 pts) Regression Models for Association
+
+Use the `glm` package to build 3 models with the following independent variables. Use the kind of regression (set with the `family` parameter) that is appropriate for the data.
+1. Age and oxy_drop
+2. Age, gender and oxy_drop
+3. Age, gender, oxy_drop and the chart value features that are signficantly associated with death after Bonferroni correction
+
+```{r}
+
+features1 <- patient_feature_matrix %>%
+  mutate(gender = ifelse(gender=="M", 1, 0))%>%
+  mutate(oxy_drop = ifelse(oxy_drop =="stable", 1, 0))%>%
+  mutate(death_in_stay = ifelse(death_in_stay =="died", 0, 1))%>%
+  data.matrix()
+
+features1 <- features1 %>%
+  as.data.frame()
+
+age_oxydrop_logical<-glm(features1$death_in_stay~age_in_days+oxy_drop,binomial(link='logit'),data=features1)
+age_oxydrop_logical
+
+age_gender_oxydrop_logical<-glm(features1$death_in_stay~age_in_days+gender+oxy_drop,binomial(link='logit'),data=features1)
+age_gender_oxydrop_logical
+
+feature_bonferroni1 <-feature_bonferroni%>%
+  pull(feature_name) %>% 
+  as.character()
+
+features1 <- features1 %>% 
+  select(c("age_in_days","gender","oxy_drop","death_in_stay", feature_bonferroni1))
+
+age_gender_oxydrop_chartvalue_logical<-glm(features1$death_in_stay~ chartvalue_198 + chartvalue_454 + chartvalue_184 + chartvalue_87 +  chartvalue_781 + chartvalue_778+ 
+ chartvalue_777 + chartvalue_450 + chartvalue_618 + chartvalue_619 + chartvalue_787 + chartvalue_615+ 
+ chartvalue_811 + chartvalue_776 + chartvalue_683 + chartvalue_861 + chartvalue_791 + chartvalue_837 +
+ chartvalue_1127+ chartvalue_815  +chartvalue_824 + chartvalue_682 + chartvalue_190 + chartvalue_779 +
+ chartvalue_444 + chartvalue_825 + age_in_days+gender+oxy_drop,binomial(link='logit'),data=features1)
+
+age_gender_oxydrop_chartvalue_logical
+
+```
+
+#### 2.2.2 (9 pts) Comparing regression models
+
+What is the coefficient for `oxy_drop` in each model and what is its confidence interval? 
+Why does the point estimate change as more features are added? 
+Assuming you had a model of $Y$ regressed on $X_1$ and you added the variable $X_2$, under what conditions would the coefficient for $X_1$ not change? If both are positively correlated with the outcome and with each other, what would happen to the coefficient of $X_1$ after adding $X_2$? Why?
+
+```{r}
+age_oxydrop_logical
+confint(age_oxydrop_logical)
+#5.747e-01 
+#2.5 %        97.5 %
+#3.900444e-01  7.581675e-01
+age_gender_oxydrop_logical
+confint(age_gender_oxydrop_logical)
+#5.778e-01 
+#       2.5 %        97.5 %
+#3.928747e-01  7.615069e-01
+age_gender_oxydrop_chartvalue_logical
+confint(age_gender_oxydrop_chartvalue_logical)
+#0.315069 
+#       2.5 %        97.5 %
+#1.060480e-01  5.226494e-01
+
+#when x2 is independent with x1, the coefficient for x1 not change
+#the coefficient of x1 will decrease.
+
+```
+
+#### 2.2.3 (4 pts) Legitimancy of Confidence Intervals
+Assuming there are no systematic biases in the data and the only errors are from random sampling noise, do you think these confidence intervals are legitimate for all of these models, for none of them, or only for some of them? Explain your answer. If you said any of the confidence intervals are not legitimate, explain what you could change about the modeling procedure to make them so.
+
+```{r}
+
+#I think these confidence intervals are not all legitimate, the first one is make sense because the CI of it is all positive number.If the CI 2.5% is negative, 97.5% is positive, it will be not legitimate. thats why the gender added in the second model make no sense.
+#The CI of the third model is not legitimate. Because the CI of the third model grows larger, this model makes the whole things more inaccuracy. 
+
+```
+
+#### 2.2.4 (4 pts) Goodness-of-fit testing
+
+One way to compare models that use an increasing number of features is to test whether the residuals (the differences between the true outcome and the predicted outcome) are significantly different from each other. This is conceptually the same as assessing the likelihood of the data under each fitted model. In `R`, you can do that with the `anova` function by passing it a series of (generalized) linear models. Compare the 3 models you built in 2.2.1. Which model has the best fit (smallest deviance)? If we compared these three models using a held-out test set, would the same model necessarily have the lowest error? Why or why not?
+
+
+```{r}
+library(car)
+anova(age_oxydrop_logical,age_gender_oxydrop_logical,age_gender_oxydrop_chartvalue_logical)
+#The third model has the best fit. Because the resid.dev is the smallest.
+#If we use the held-out test set, the same model is not necessarily have the lowest error, because we are not sure about whether the test set is tested, so we are not sure.
+
+```
+
+### 2.3 (25 pts) Survival Analysis
+In this part of the assignment you will use `survival`, `survminer` and `coxph` to fit survival (time-to-event) models. 
+Some resources you might find useful:
+
+(1) https://cran.r-project.org/web/packages/survival/vignettes/survival.pdf
+
+(2) https://www.emilyzabor.com/tutorials/survival_analysis_in_r_tutorial.html#part_1:_introduction_to_survival_analysis
+
+(3) https://www.datacamp.com/community/tutorials/survival-analysis-R
+
+```{r}
+
+library(survival)
+library(survminer)
+
+```
+
+#### 2.3.1 (4 pts) Creating Survival Data
+
+Use the `cohort.csv` data to calculate the survival time (until death or censoring) for all patients. Use the `index_time`, `deathtime` and `censor_time` columns, as well as the function `mutate` to accomplish this. The time unit should be in days. Save these data in a new data frame called `patients_survival` that also keeps track of the `oxy_drop` value for each patient.
+
+```{r}
+
+patients_survival<-cohort%>%
+select("index_time","deathtime","censor_time","oxy_drop","death_in_stay")%>%
+mutate(survivaltime = difftime(censor_time, index_time, units="days"))
+patients_survival
+
+```
+
+#### 2.3.2 (11 pts) Kaplan-Meier Curves
+
+Use your `patients_survival` data to generate Kaplan-Meier curves for patients. There are some packages available that will calculate survival statistics and Kaplan-Meier plots for you, such as `survival` and `survminer`. Use functions in these packages to generate Kaplan-Meier curves for the survival data you created above for the two cases below. Make sure to include survival event (dead or censored) in your analysis. You might find the following function useful: Surv, survfit from `survival` and ggsurvplot from `survminer`
+
+(a) Generate Kaplan-Meier curve for all patients in your survival data without any stratification (no distinction between patients who suffered a sudden and sustained drop in oxygenation and those who did not (stable). Explain in few sentences what this curve represents.
+```{r}
+patients_survival1 <-patients_survival %>%
+  mutate(death_in_stay = ifelse(death_in_stay =="died", 1, 0)) 
+surv_object <- Surv(time = (patients_survival1$survivaltime),event = patients_survival1$death_in_stay)
+fit0 <- survfit(surv_object ~ 1, data = patients_survival1)
+ggsurvplot(fit0, data = patients_survival1, pval = TRUE)
+
+#This curve represents: when the Time last longer, the survival probability goes down.
+#when the time is 160, the survival probability is around 30%
+
+```
+
+(b) Generate Kaplan-Meier curves with stratification i.e.  for patients who suffered a sudden and sustained drop in oxygenation and those who did not (stable). Display both curves on the same plot in different colors. Explain the plot in a few sentences.
+```{r}
+
+surv_object <- Surv(time = patients_survival1$survivaltime, event = patients_survival1$death_in_stay)
+
+fit <- survfit(surv_object ~ patients_survival1$oxy_drop ,data = patients_survival1)
+
+ggsurvplot(fit, data = patients_survival1, pval = TRUE)
+
+#This curve represents: the people suffered from the oxy drop, when it becomes longer than 80 days, 50% of them will survive, and 50% of them will die. for the people suffered the stable oxy_drop, the time last longer, their survival probability will go down all the time. when the time is 160 days, stable oxydrop patient will has 20% possibility to survive.
+
+```
+
+
+
+#### 2.3.3 (10 pts) Cox Proportional Hazards Models
+
+Use your `patients_survial` data combined with the patient feature matrix to run a univariate cox proportional hazards model of mortality regressed on a drop in oxygenation. 
+
+Don't worry if you get a warning message about convergence. What is the value of the coefficient and its confidence interval? 
+
+Also run a model adjusted for all of the non-zero variance features. What is the value of the coefficient for the drop in oxygenation and its confidence interval in that model? What is an explanation for the difference in the results?
+
+```{r}
+
+patients_survival2<-patients_survival%>%
+  mutate(death_in_stay = ifelse(death_in_stay =="died", 1, 0)) %>%
+mutate(oxy_drop = ifelse(oxy_drop =="stable", 0, 1)) 
+surv_object <- Surv(time = patients_survival2$survivaltime, event = patients_survival2$death_in_stay)
+fit.coxph <- coxph(surv_object ~ patients_survival2$oxy_drop, data = patients_survival2)
+summary(fit.coxph)
+confint(fit.coxph)
+#                                 2.5 %    97.5 %
+#patients_survival2$oxy_drop -0.1121158 0.2151989
+#coefficient: 0.05154  
+
+patients_survival3<-cohort%>%
+select("subject_id","index_time","deathtime","censor_time","oxy_drop","death_in_stay")%>%
+mutate(survivaltime = difftime(censor_time, index_time, units="days"))%>%
+    mutate(death_in_stay = ifelse(death_in_stay =="died", 1, 0)) %>%
+mutate(oxy_drop = ifelse(oxy_drop =="stable", 0, 1)) 
+patients_survival3
+
+features2 <- patient_feature_matrix %>%
+  mutate(gender = ifelse(gender=="M", 1, 0))%>%
+  mutate(oxy_drop = ifelse(oxy_drop =="stable", 0, 1))
+
+features_caret2 <- features2 %>%
+  nearZeroVar(saveMetrics = TRUE, names = FALSE) %>% 
+  mutate(name=row.names(.))%>%
+  filter(nzv == "FALSE")%>%
+  pull(name)
+
+features2 <-features2%>%
+  data.frame()
+features2 <-features2 %>% 
+  select(features_caret2)
+features2<- features2%>% 
+  select(subject_id)
+features2<-features2%>%
+  mutate(death_in_stay = ifelse(death_in_stay =="died", 1, 0)) %>%
+mutate(oxy_drop = ifelse(oxy_drop =="stable", 0, 1)) 
+features2<- features2%>% 
+  data.table()
+patients_survival3 <-patients_survival3%>%
+  data.table()
+
+feature_nzv_survival <- left_join(patients_survival3,features2, by = "subject_id")
+surv_object1 <- Surv(time = feature_nzv_survival$survivaltime, event = feature_nzv_survival$death_in_stay.x)
+fit.coxph1 <- coxph(surv_object1 ~ feature_nzv_survival$oxy_drop.x, data = feature_nzv_survival)
+summary(fit.coxph1)
+confint(fit.coxph1)
+# 2.5 %    97.5 %
+#-0.1121158 0.2151989  
+
+surv_object2 <- Surv(time = feature_nzv_survival$survivaltime, event = feature_nzv_survival$death_in_stay.x)
+fit.coxph2 <- coxph(surv_object1 ~ ., data = feature_nzv_survival)
+summary(fit.coxph2)
+fit.coxph2[["coefficients"]][["oxy_drop.x"]]
+confint(fit.coxph2)["oxy_drop.x",]
+#coefficient:-1.081802
+#    2.5 %    97.5 % 
+#-1.251559 -0.912045
+
+
+#when I do the adjustment, the CI changed from one negative, one positive to both of them are negative, it means that the model become meaningful, because the adjusted model makes the independent variable and the dependent variable has relationship.
+
+
+```
